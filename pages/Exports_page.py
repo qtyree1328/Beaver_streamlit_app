@@ -1,4 +1,5 @@
 import streamlit as st
+import seaborn as sns
 import streamlit.components.v1 as components
 import folium
 from streamlit_folium import st_folium
@@ -9,7 +10,8 @@ from streamlit_folium import folium_static
 from scipy.stats import gaussian_kde
 from sklearn.metrics import roc_curve, auc, accuracy_score
 from Sentinel2_functions import process_Sentinel2_with_cloud_coverage
-from Export_dam_imagery import  S2_PixelExtraction_Export
+from Export_dam_imagery import  S2_PixelExtraction_Export,S2_Export_for_visual ,Sentinel_Only_Export,compute_ndvi_mean
+from Negative_sample_functions import deduplicate_locations, prepareHydro,sampleNegativePoints
 import ee 
 import os
 import numpy as np
@@ -18,13 +20,11 @@ import pandas as pd
 import tempfile
 import rasterio
 
-# -------- Page Setup--------
-
-st.set_page_config(layout="wide")
+# st.set_page_config(layout="wide")
 
 ee.Authenticate()
 try:
-    ee.Initialize()
+    ee.Initialize(project = 'ee-beaver-lab')
     st.success("Earth Engine successfully initialized.")
 except Exception as e:
     st.error(f"Earth Engine Authentication Error: {e}")
@@ -109,8 +109,8 @@ def upload_points_to_ee(file):
         return None
 
 # Initialize session state variables
-if "Combined_collection" not in st.session_state:
-    st.session_state.Combined_collection = None
+if "Positive_collection" not in st.session_state:
+    st.session_state.Positive_collection = None
 if "buffer_radius" not in st.session_state:
     st.session_state.buffer_radius = 200
 
@@ -139,7 +139,7 @@ def set_id_year_property(feature):
 
 
 # Streamlit UI
-st.title("Upload, Draw, and Buffer Points - GEE")
+st.title("Analyzing the Impact of Beaver Dams")
 
 # Section: Upload Points
 st.header("Upload Points")
@@ -153,13 +153,15 @@ uploaded_file = st.file_uploader("Choose a CSV or GeoJSON file", type=["csv", "g
 if uploaded_file:
     feature_collection = upload_points_to_ee(uploaded_file)
     if feature_collection:
-        st.session_state.Combined_collection = feature_collection  # Save to session state
+        st.session_state.Positive_collection = feature_collection  # Save to session state
+        st.session_state['Full_positive'] = st.session_state.Positive_collection
+
         # st.write("Standardized Feature Collection:")
         # st.json(geemap.ee_to_geojson(feature_collection))
 
 
 # Section: Draw Points
-st.header("Draw Points")
+st.subheader("Draw Points (optional)")
 enable_drawing = st.checkbox("Enable drawing on the map")
 
 # Initialize map
@@ -175,8 +177,8 @@ folium.TileLayer(
 ).add_to(draw_map)
 
 # Add uploaded points to the map
-if st.session_state.Combined_collection:
-    geojson_layer = geemap.ee_to_geojson(st.session_state.Combined_collection)
+if st.session_state.Positive_collection:
+    geojson_layer = geemap.ee_to_geojson(st.session_state.Positive_collection)
     folium.GeoJson(geojson_layer, name="Uploaded Points").add_to(draw_map)
 
 # Add drawing functionality if enabled
@@ -215,77 +217,18 @@ if points_list:
     ee_points = ee.FeatureCollection(
         [ee.Feature(ee.Geometry.Point(coord), {"id": idx}) for idx, coord in enumerate(points_list)]
     )
-    if st.session_state.Combined_collection:
-        st.session_state.Combined_collection = st.session_state.Combined_collection.merge(ee_points)
+    if st.session_state.Positive_collection:
+        st.session_state.Positive_collection = st.session_state.Positive_collection.merge(ee_points)
     else:
-        st.session_state.Combined_collection = ee_points
+        st.session_state.Positive_collection = ee_points
+
+
 
 
 # Combined Dam Status and Buffering Section
-st.header("Dam Status and Buffer Process")
-
-
-
-# User inputs for Dam status and buffer radius
-dam_status = st.selectbox("Select Dam Status", ["positive", "negative"], index=0)
-buffer_radius = st.number_input(
-    "Enter buffer radius in meters:", min_value=1, step=1, value=st.session_state.buffer_radius
-)
-
-
-# Button to apply Dam status and create buffers
-if st.button("Apply Dam Status and Create Buffers"):
-    if st.session_state.Combined_collection is None:
-        st.error("No points available to process. Please upload or draw points.")
-    else:
-        # Function to add Dam status, buffer, and standardize date
-        def add_dam_buffer_and_standardize_date(feature):
-            # Add Dam property and other metadata
-            feature_with_dam = feature.set("Dam", dam_status)
-            date = feature_with_dam.get("date")
-            formatted_date = ee.Date(date).format('YYYYMMdd')
-            
-            # Buffer geometry while retaining properties
-            buffered_geometry = feature_with_dam.geometry().buffer(buffer_radius)
-            
-            # Create a new feature with buffered geometry and updated properties
-            return ee.Feature(buffered_geometry).set({
-                "Dam": dam_status,
-                "Survey_Date": ee.Date(date),
-                "Damdate": ee.String("DamDate_").cat(formatted_date),
-                "Point_geo": feature_with_dam.geometry(),
-                "id_property": feature.get("DamID")
-            })
-
-        # Apply the function to the feature collection
-        Buffered_collection = st.session_state.Combined_collection.map(add_dam_buffer_and_standardize_date)
-
-        # Select only relevant properties
-        Dam_data = Buffered_collection.select(['id_property', 'Dam', 'Survey_Date', 'Damdate', 'Point_geo'])
-
-        # Save to session state
-        st.session_state['Dam_data'] = Dam_data
-
-        # Display success message and buffered collection
-        st.success(f"Buffers created with Dam status '{dam_status}' and radius {buffer_radius} meters.")
-
-if 'Dam_data' in st.session_state:
-    st.write("Buffered Feature Collection:")
-    dam_bounds = st.session_state['Dam_data'].geometry().bounds()
-    states_dataset = ee.FeatureCollection("TIGER/2018/States")  # US States boundaries dataset
-    states_with_dams = states_dataset.filterBounds(dam_bounds)
-    st.session_state['Dam_state'] = states_with_dams
-    Buffer_map = geemap.Map()
-    Buffer_map.add_basemap("SATELLITE")
-    Buffer_map.addLayer(st.session_state['Dam_data'], {"color": "blue"}, "Buffered Points")
-    Buffer_map.centerObject(st.session_state['Dam_data'])
-    Buffer_map.to_streamlit(width=800, height=600)
-
-# Ensure session state for selected datasets and workflow progression
-if "selected_datasets" not in st.session_state:
-    st.session_state.selected_datasets = {}  # Store datasets for further analysis
-if "workflow_step" not in st.session_state:
-    st.session_state.workflow_step = "waterway_selection"  # Workflow state machine
+if "Combined_collection" not in st.session_state:
+    st.session_state.Combined_collection = None
+        # st.session_state.Positive_collection = feature_collection
 if "selected_waterway" not in st.session_state:
     st.session_state.selected_waterway = None  # Selected hydro dataset
 if "dataset_loaded" not in st.session_state:
@@ -294,9 +237,10 @@ if "dataset_loaded" not in st.session_state:
 
 
 # Step 1: Upload Waterway
-if 'Dam_data' in st.session_state:
-    st.header("Upload Waterway")
-    st.write("Select what you would like to do:")
+if 'Full_positive' in st.session_state:
+    # st.header("Upload Waterway")
+    st.header("Generate Negative Locations")
+    st.subheader("1. Choose Waterway Map to generate negatives- choose one")
     upload_own_checkbox = st.checkbox("Upload Own Dataset")
     choose_existing_checkbox = st.checkbox("Choose an Existing Dataset")
 
@@ -318,8 +262,12 @@ if 'Dam_data' in st.session_state:
 
     # Handle "Choose an Existing Dataset"
     if choose_existing_checkbox:
-        if 'Dam_data' in st.session_state:
-            states_geo = st.session_state['Dam_state']
+        if 'Full_positive' in st.session_state:
+            positive_dam_bounds = st.session_state['Full_positive'].geometry().bounds()
+            states_dataset = ee.FeatureCollection("TIGER/2018/States")  # US States boundaries dataset
+            states_with_dams = states_dataset.filterBounds(positive_dam_bounds)
+            st.session_state['Positive_dam_state'] = states_with_dams
+            states_geo = st.session_state['Positive_dam_state']
             state_names = states_geo.aggregate_array("NAME").getInfo()
 
             if not state_names:
@@ -371,6 +319,7 @@ if 'Dam_data' in st.session_state:
                             if nhd_collections:
                                 merged_nhd = ee.FeatureCollection(nhd_collections).flatten()
                                 st.session_state.selected_waterway = merged_nhd
+                                st.session_state['Waterway'] = st.session_state.selected_waterway
                                 st.session_state.dataset_loaded = True
                                 st.success("NHD datasets for selected states loaded and added to the map.")
                             else:
@@ -379,267 +328,510 @@ if 'Dam_data' in st.session_state:
                         st.error(f"Failed to load the dataset. Error: {e}")
 
     # Display the map
-    if st.session_state.selected_waterway:
+    if 'Waterway' in st.session_state:
+        Waterway_map.centerObject(st.session_state['Full_positive'],zoom = 10)
         Waterway_map.addLayer(st.session_state.selected_waterway, {"color": "blue"}, "Selected Waterway")
-    if 'Dam_data' in st.session_state:
-        Waterway_map.centerObject(st.session_state['Dam_data'])
-    st.write("Waterway Map:")
-    Waterway_map.to_streamlit(width=1200, height=700)
+        Waterway_map.addLayer(st.session_state['Full_positive'],{'color': 'FF0000'},'Dams')
 
-    # # "Use this Waterway Map" button
-    if st.session_state.dataset_loaded:
-        if st.button("Use this Waterway Map"):
-            Initiate_analysis = 'initiate' 
-            st.session_state['Initiate_analysis'] = Initiate_analysis
+        st.write("Waterway Map:")
+        Waterway_map.to_streamlit(width=1200, height=700)
 
+if 'Waterway' in st.session_state:
+    st.subheader("2. Specify the parameters for negative point generation:")
 
-
-# Step 2: Dataset Selection and Visualization
-# Dataset IDs and their processing logic
-datasets = {
-    "CHIRPS Precipitation": {
-        "processing": lambda start, end, bounds: ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY")
-        .filterDate(start, end)
-        .filterBounds(bounds)
-        .mean()
-        .select('precipitation')
-        .rename('CHIRPS_precipitation_2yr_avg')
-        .clip(bounds),
-        "visualization": {"min": 1, "max": 17, "palette": ['001137', '0aab1e', 'e7eb05', 'ff4a2d', 'e90000']},
-    },
-    "ECMWF Precipitation": {
-        "processing": lambda start, end, bounds: ee.ImageCollection("ECMWF/ERA5_LAND/MONTHLY_BY_HOUR")
-        .filterDate(start, end)
-        .filterBounds(bounds)
-        .mean()
-        .select("total_precipitation")
-        .rename("ECMWF_precipitation_2yr_avg")
-        .clip(bounds),
-        "visualization": {"min": 0, "max": 300, "palette": ["blue", "cyan", "green", "yellow", "red"]},
-    },
-    "Temperature": {
-        "processing": lambda start, end, bounds: ee.ImageCollection("ECMWF/ERA5_LAND/MONTHLY_BY_HOUR")
-        .filterDate(start, end)
-        .filterBounds(bounds)
-        .mean()
-        .select('temperature_2m')
-        .rename('ECMWF_temperature_2m_2yr_avg')
-        .clip(bounds),
-        "visualization": {"min": 250, "max": 320, "palette": [
-            '000080', '0000d9', '4000ff', '8000ff', '0080ff', '00ffff',
-            '00ff80', '80ff00', 'daff00', 'ffff00', 'fff500', 'ffda00',
-            'ffb000', 'ffa400', 'ff4f00', 'ff2500', 'ff0a00', 'ff00ff',
-        ]},
-    },
-    "Surface Runoff": {
-        "processing": lambda start, end, bounds: ee.ImageCollection("ECMWF/ERA5_LAND/MONTHLY_BY_HOUR")
-        .filterDate(start, end)
-        .filterBounds(bounds)
-        .mean()
-        .select("surface_runoff")
-        .rename("ECMWF_surface_runoff_2yr_avg")
-        .clip(bounds),
-        "visualization": {"min": 0, "max": 50, "palette": ["blue", "cyan", "green", "yellow", "red"]},
-    },
-    "Elevation": {
-        "processing": lambda start, end, bounds: ee.Image("USGS/3DEP/10m")
-        .select('elevation')
-        .rename('Elevation')
-        .clip(bounds),
-        "visualization": {"min": 0, "max": 3000, "palette": [
-            '3ae237', 'b5e22e', 'd6e21f', 'fff705', 'ffd611', 'ffb613', 'ff8b13',
-            'ff6e08', 'ff500d', 'ff0000', 'de0101', 'c21301', '0602ff', '235cb1',
-            '307ef3', '269db1', '30c8e2', '32d3ef', '3be285', '3ff38f', '86e26f'
-        ],},
-    },  
-    "Slope": {
-        "processing": lambda start, end, bounds: ee.Terrain.slope(ee.Image("USGS/3DEP/10m").select('elevation'))
-        .rename('Slope')
-        .clip(bounds),
-        "visualization": {"min": 0, "max": 60},
-    },
-    "Vegetation": {
-        "processing": lambda start, end, bounds: ee.Image("USGS/GAP/CONUS/2011")
-        .clip(bounds),
-        "visualization": {"bands":['landcover'],"min": 1, "max": 584},
-    },
-}
-
-# Function to extract the date range and geometry for the first dam
-def get_state_bounds_and_date_range():
-    if "Dam_data" not in st.session_state:
-        st.error("No dam data available.")
-        return None, None
-    dam_data = st.session_state["Dam_data"]
-    first_dam = dam_data.first()
-    image_date = ee.Date(first_dam.get("Survey_Date"))
-    start_date = image_date.advance(-6, 'month').format("YYYY-MM-dd")
-    end_date = image_date.advance(6, 'month').format("YYYY-MM-dd")
-    # Get state bounds
-    states_dataset = ee.FeatureCollection("TIGER/2018/States")
-    state_bounds = states_dataset.filterBounds(dam_data.geometry().bounds()).geometry()
-    return start_date, end_date, state_bounds
-
-if 'Initiate_analysis' in st.session_state:
-    st.header("Select Additional Datasets to Include")
-
-    start_date, end_date, state_bounds = get_state_bounds_and_date_range()
-    if not (start_date and end_date and state_bounds):
-        st.stop()
-
-# Checkboxes for dataset selection
-    st.write("Select datasets to include:")
-    for dataset_name in datasets.keys():
-        st.session_state.selected_datasets[dataset_name] = st.checkbox(
-            dataset_name,
-            value=st.session_state.selected_datasets.get(dataset_name, True),
-        )
-     # Map for Dataset Visualization
-    st.write("Visualize Dataset on the Map")
-    Dataset_Map = geemap.Map()
-    Dataset_Map.add_basemap("SATELLITE")
-
-    selected_dataset_name = st.selectbox("Choose a dataset to visualize:", ["Choose"] + list(datasets.keys()))
-    if selected_dataset_name != "Choose":
-        dataset = datasets[selected_dataset_name]["processing"](start_date, end_date, state_bounds)
-        vis_params = datasets[selected_dataset_name]["visualization"]
-        Dataset_Map.addLayer(dataset, vis_params, f"{selected_dataset_name} (Processed)")
-
-    # Display the map
-    Dataset_Map.centerObject(st.session_state["Dam_data"])
-    Dataset_Map.to_streamlit(width=1200, height=700)
-
-    # # "Use this Waterway Map" button
-    if st.button("Confirm Datasets"):
-        Confirm_datasets = 'confirm' 
-        st.session_state['Confirm_datasets'] = Confirm_datasets
-
-# Step 3: Filter Imagery per Dam
-if 'Confirm_datasets' in st.session_state:
-    st.success("Datasets confirmed. Proceeding to filter imagery.")
-    st.header("Filter Imagery per Dam")
-     # Button to start filtering process
-    if st.button("Run Filtering and Visualization Process"):
-        with st.spinner("Processing... this may take some time."):
-            # Filter Imagery
-            Dam_Collection = st.session_state['Dam_data']
-            One_dam = Dam_Collection.limit(2)
-            S2 = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
-            S2_cloud_filter = process_Sentinel2_with_cloud_coverage(S2)
-
-            selected_datasets = st.session_state.selected_datasets
-            Hydro = st.session_state.selected_waterway
-
-            ImageFilter = S2_PixelExtraction_Export(One_dam, S2_cloud_filter, Hydro, selected_datasets)
-            st.session_state['Single Image Collection'] = ImageFilter
-
-
-if 'Single Image Collection' in st.session_state:
-    Image_collection = st.session_state['Single Image Collection']
-    S2_filename_id = Image_collection.aggregate_array("Full_id").getInfo()
-    cloud_free_id = next((id for id in S2_filename_id if id.endswith("Cloud_0.0")), None)
-
-    if not cloud_free_id:
-                st.error("No cloud-free images (Cloud_0.0) found in the collection.")
-    else:
-        specific_image = Image_collection.filter(ee.Filter.eq("Full_id", cloud_free_id)).first()
-        all_bands = specific_image.bandNames().getInfo()
-
-        # Define visualization options
-        visualization_options = {
-            "NDVI": specific_image.normalizedDifference(["S2_NIR", "S2_Red"]).rename("NDVI"),
-            "NDWI": specific_image.normalizedDifference(["S2_Green", "S2_NIR"]).rename("NDWI"),
-            "EVI": specific_image.expression(
-                "2.5 * ((NIR - Red) / (NIR + 6 * Red - 7.5 * Blue + 1))",
-                {"NIR": specific_image.select("S2_NIR"), "Red": specific_image.select("S2_Red"), "Blue": specific_image.select("S2_Blue")}
-            ).rename("EVI"),
-            "True Color (RGB)": specific_image.select(["S2_Red", "S2_Green", "S2_Blue"]),
-        }
-
-        # Combine bands and visualization options into a single dropdown
-        dropdown_options = all_bands + list(visualization_options.keys())
+    # User inputs for buffer radii & sampling scale
+    innerRadius = st.number_input("Inner Radius (meters)", value=500, min_value=0, step=50)
+    outerRadius = st.number_input("Outer Radius (meters)", value=5000, min_value=0, step=100)
+    samplingScale = st.number_input("Sampling Scale (meters)", value=10, min_value=1, step=1)
+    
+    # Input for the date year
+    if st.button("Generate Negative Points"):
+        with st.spinner("Generating negative points..."):
+            # 1) Deduplicate Positive Dams and get centroids
+            first_pos = st.session_state.Positive_collection.first()
+            date = ee.Date(first_pos.get('date'))
+            year_string = date.format('YYYY')
+            full_date = ee.String(year_string).cat('-07-01')
         
-        st.success("Processing complete!")
-        st.subheader("Visualize", divider='green')
-        selected_option = st.selectbox("Select a band or visualization type:", ["Choose"] + dropdown_options)
-
-        # Initialize map
-        Image_Map = geemap.Map()
-        Image_Map.add_basemap("SATELLITE")
-        Image_Map.centerObject(specific_image)
-
-        # Check the selected option
-        if selected_option != "Choose":
-            if selected_option in all_bands:
-                vis_image = specific_image.select(selected_option)
-                vis_params = {"min": 0, "max": 3000}  # Adjust based on the band's range
-            elif selected_option in visualization_options:
-                vis_image = visualization_options[selected_option]
-                vis_params = {"min": 0, "max": 1} if selected_option in ["NDVI", "NDWI", "EVI"] else {"min": 0, "max": 3000}
-            else:
-                vis_image = None
-
-            if vis_image:
-                Image_Map.addLayer(vis_image, vis_params, selected_option)
-
-        # Display the map
-        st.write("Image Visualization:")
-        Image_Map.to_streamlit(width=1200, height=700)
 
 
+            positive_dams_fc = deduplicate_locations(st.session_state.Positive_collection)
+            
+            # 2) Convert waterway feature collection to a raster mask
+            waterway_fc = st.session_state.selected_waterway  # The loaded hydro dataset
+            hydroRaster = prepareHydro(waterway_fc)
+            
+            # 3) Sample negative points
+            negativePoints = sampleNegativePoints(
+                positive_dams_fc, 
+                hydroRaster, 
+                innerRadius, 
+                outerRadius, 
+                samplingScale
+            )
+            negativePoints = negativePoints.map(lambda feature: feature.set('Dam', 'negative').set("date",full_date))
+            
+            fc = negativePoints
+            features_list = fc.toList(fc.size())
+            indices = ee.List.sequence(0, fc.size().subtract(1))
+            # Step 3: Map over the indices to get each feature and set a new property.
+            def set_id(idx):
+                idx = ee.Number(idx)
+                feature = ee.Feature(features_list.get(idx))
+                # Cast idx.add(1) to an integer and then format as a string without decimals.
+                labeled_feature = feature.set(
+                    'id_property', ee.String('N').cat(idx.add(1).int().format())
+                )
+                return labeled_feature
+            
+            def id_property(feature):
+                id = feature.get('DamID')
+                feature.set("id_property",id).set("Dam","positive")
+                return feature
+            
+            Neg_points_id = ee.FeatureCollection(indices.map(set_id))
+            Positive_Dams = st.session_state.Positive_collection
+            Positive_dam_id = Positive_Dams.map(lambda feature: feature.set('Dam', 'positive').set('id_property', feature.get('DamID')))
+            Merged_collection = Positive_dam_id.merge(Neg_points_id)
+            st.session_state['Merged_collection'] = Merged_collection
 
-if 'Single Image Collection' in st.session_state:
-    # Step 4: Export Images to Computer
-    st.subheader("Export", divider='green')
+            Negative_points = geemap.Map()
+            Negative_points.add_basemap("SATELLITE")
+            Negative_points.addLayer(negativePoints,{'color': 'red', 'width': 2},'Negative')
+            Negative_points.addLayer(Positive_dam_id,{'color': 'blue'},'Positive')
+            Negative_points.centerObject(Merged_collection)
+            Negative_points.to_streamlit(width=1200, height=700)
+            
 
-    export_dir = st.text_input(
-        "Enter the folder path where you want to export the images. "
-        "Example (Windows): C:\\Users\\John\\Desktop\\ExportFolder. "
-        "Example (Mac/Linux): /home/yourusername/Documents/ExportFolder"
+
+if 'Merged_collection' in st.session_state:
+    st.subheader("3. Buffer dam locations:")
+
+    # User inputs for Dam status and buffer radius
+    buffer_radius = st.number_input(
+        "Enter buffer radius in meters:", min_value=1, step=1, value=st.session_state.buffer_radius
     )
-   # Button to start export process
-    if st.button("Export Images"):
-        if not export_dir:
-            st.error("Please specify a folder path.")
-        else:
-            with st.spinner(f"Exporting images to {export_dir}... this may take some time."):
-                try:
-                    # Split the Dam_Collection into smaller chunks
-                    Dam_Collection = st.session_state['Dam_data']
-                    num_chunks = 10  # Adjust based on your dataset size
-                    dam_list = Dam_Collection.toList(Dam_Collection.size())
-                    chunk_size = ee.Number(Dam_Collection.size()).divide(num_chunks).ceil().getInfo()
 
-                    for i in range(num_chunks):
-                        # Slice the current chunk
-                        chunk = dam_list.slice(i * chunk_size, (i + 1) * chunk_size)
-                        dam_chunk = ee.FeatureCollection(chunk)
+    # Button to apply Dam status and create buffers
+    if st.button("Apply Dam Status and Create Buffers"):
+        # Function to add Dam status, buffer, and standardize date
+        def add_dam_buffer_and_standardize_date(feature):
+            # Add Dam property and other metadata
+            dam_status = feature.get("Dam")
+            date = feature.get("date")
+            formatted_date = ee.Date(date).format('YYYYMMdd')
+            
+            # Buffer geometry while retaining properties
+            buffered_geometry = feature.geometry().buffer(buffer_radius)
+            
+            # Create a new feature with buffered geometry and updated properties
+            return ee.Feature(buffered_geometry).set({
+                "Dam": dam_status,
+                "Survey_Date": ee.Date(date),
+                "Damdate": ee.String("DamDate_").cat(formatted_date),
+                "Point_geo": feature.geometry(),
+                "id_property": feature.get("id_property")
+            })
+
+        # Apply the function to the feature collection
+        Merged_col = st.session_state['Merged_collection']
+        Buffered_collection = st.session_state['Merged_collection'].map(add_dam_buffer_and_standardize_date)
+
+        # Select only relevant properties
+        Dam_data = Buffered_collection.select(['id_property', 'Dam', 'Survey_Date', 'Damdate', 'Point_geo'])
+
+        # Save to session state
+        st.session_state['Dam_data'] = Dam_data
+
+        st.success(f"Buffers created with radius {buffer_radius} meters.")
+
+if 'Dam_data' in st.session_state:
+    st.write("Buffered Feature Collection:")
+    dam_bounds = st.session_state['Dam_data'].geometry().bounds()
+    states_dataset = ee.FeatureCollection("TIGER/2018/States")  # US States boundaries dataset
+    states_with_dams = states_dataset.filterBounds(dam_bounds)
+    st.session_state['Dam_state'] = states_with_dams
+    Dam_data = st.session_state['Dam_data']
+    Negative = Dam_data.filter(ee.Filter.eq('Dam', 'negative'))
+    Positive = Dam_data.filter(ee.Filter.eq('Dam', 'positive'))
+
+    Buffer_map = geemap.Map()
+    Buffer_map.add_basemap("SATELLITE")
+    # Buffer_map.addLayer(st.session_state['Dam_data'], {"color": "blue"}, "Buffered Points")
+    Buffer_map.addLayer(Negative,{'color': 'red'},'Negative')
+    Buffer_map.addLayer(Positive,{'color': 'blue'},'Positive')
+    Buffer_map.centerObject(st.session_state['Dam_data'])
+    Buffer_map.to_streamlit(width=800, height=600)
+    st.header("Visualize trends")
+    if st.button("Visualize Trends"):
+        Initiate_visualize = 'visualize' 
+        st.session_state['Visualize_trends'] = Initiate_visualize
+
+
+if 'Visualize_trends' in st.session_state:
+    
+    with st.spinner("Processing... this may take some time."):
+        # Filter Imagery
+        Dam_data = st.session_state['Dam_data']
+
+        S2_cloud_mask_export = ee.ImageCollection(S2_Export_for_visual(Dam_data))
+        S2_ImageCollection = ee.ImageCollection(S2_cloud_mask_export)
+
+        results_fc = S2_ImageCollection.map(compute_ndvi_mean)
+        results_fcc = ee.FeatureCollection(results_fc)       
+        df = geemap.ee_to_df(results_fcc)
+        
+        st.success("Dataframe generated!")
+
+        # # Convert Image_month to numeric for proper ordering
+        df['Image_month'] = pd.to_numeric(df['Image_month'])
+
+        # Sort the DataFrame by month
+        df = df.sort_values(by='Image_month')
+
+        sns.set(style="whitegrid", palette="muted")
+        plt.figure(figsize=(12, 10), facecolor= 'none', edgecolor='none')  # Adjusted size for two plots
+
+        # Plot NDVI grouped by Dam_status and month
+        plt.subplot(2, 1, 1)  # Create a subplot for the first plot (NDVI)
+        sns.lineplot(
+            data=df, 
+            x="Image_month", 
+            y="NDVI", 
+            hue="Dam_status", 
+            style="Dam_status",
+            markers=True, 
+            dashes=False
+        )
+
+        # Add labels and title for NDVI plot
+        plt.title('NDVI by Month for Positive and Negative Sites', fontsize=14, color='white')
+        plt.xlabel('Month', fontsize=12, color='white')
+        plt.ylabel('Mean NDVI', fontsize=12, color='white')
+        plt.legend(title='Dam Status', loc='upper right')
+        plt.xticks(range(1, 13),color='white') 
+        plt.yticks(color='white') 
+
+        # Plot NDWI_Green grouped by Dam_status and month
+        plt.subplot(2, 1, 2)  # Create a subplot for the second plot (NDWI_Green)
+        sns.lineplot(
+            data=df, 
+            x="Image_month", 
+            y="NDWI_Green", 
+            hue="Dam_status", 
+            style="Dam_status",
+            markers=True, 
+            dashes=False
+        )
+
+        # Add labels and title for NDWI_Green plot
+        plt.title('NDWI Green by Month for Positive and Negative Sites', fontsize=14, color='white')
+        plt.xlabel('Month', fontsize=12, color='white')
+        plt.ylabel('Mean NDWI Green', fontsize=12, color='white')
+        plt.legend(title='Dam Status', loc='upper right')
+        plt.xticks(range(1, 13),color='white')  
+        plt.yticks(color='white') 
+        plt.subplots_adjust(wspace=0.5)
+
+        # Adjust layout and display the plot
+        plt.tight_layout()
+
+        # Show the plot in Streamlit
+        st.pyplot(plt)
+
+        st.dataframe(df)
+
+
+
+        # # Set the plot style and figure size
+        # sns.set(style="whitegrid", palette="muted")
+        # plt.figure(figsize=(12, 6))
+
+        # # Plot NDVI grouped by Dam_status and month
+        # sns.lineplot(
+        #     data=df, 
+        #     x="Image_month", 
+        #     y="NDVI", 
+        #     hue="Dam_status", 
+        #     style="Dam_status",
+        #     markers=True, 
+        #     dashes=False
+        # )
+
+        # # Add plot labels and title
+        # plt.title('NDVI by Month for Positive and Negative Sites', fontsize=14)
+        # plt.xlabel('Month', fontsize=12)
+        # plt.ylabel('Mean NDVI', fontsize=12)
+
+        # # Adjust legend and display the plot
+        # plt.legend(title='Dam Status', loc='upper right')
+        # plt.xticks(range(1, 13))  # Ensure x-axis shows all months 1-12
+        # plt.tight_layout()
+        
+        # st.pyplot(plt)
+
+
+
+# # # Ensure session state for selected datasets and workflow progression
+# if "selected_datasets" not in st.session_state:
+#     st.session_state.selected_datasets = {}  # Store datasets for further analysis
+
+
+
+#     # # "Use this Waterway Map" button
+#     if st.session_state.dataset_loaded:
+#         if st.button("Use this Waterway Map"):
+#             Initiate_analysis = 'initiate' 
+#             st.session_state['Initiate_analysis'] = Initiate_analysis
+
+
+
+# # Step 2: Dataset Selection and Visualization
+# # Dataset IDs and their processing logic
+# datasets = {
+#     "CHIRPS Precipitation": {
+#         "processing": lambda start, end, bounds: ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY")
+#         .filterDate(start, end)
+#         .filterBounds(bounds)
+#         .mean()
+#         .select('precipitation')
+#         .rename('CHIRPS_precipitation_2yr_avg')
+#         .clip(bounds),
+#         "visualization": {"min": 1, "max": 17, "palette": ['001137', '0aab1e', 'e7eb05', 'ff4a2d', 'e90000']},
+#     },
+#     "ECMWF Precipitation": {
+#         "processing": lambda start, end, bounds: ee.ImageCollection("ECMWF/ERA5_LAND/MONTHLY_BY_HOUR")
+#         .filterDate(start, end)
+#         .filterBounds(bounds)
+#         .mean()
+#         .select("total_precipitation")
+#         .rename("ECMWF_precipitation_2yr_avg")
+#         .clip(bounds),
+#         "visualization": {"min": 0, "max": 300, "palette": ["blue", "cyan", "green", "yellow", "red"]},
+#     },
+#     "Temperature": {
+#         "processing": lambda start, end, bounds: ee.ImageCollection("ECMWF/ERA5_LAND/MONTHLY_BY_HOUR")
+#         .filterDate(start, end)
+#         .filterBounds(bounds)
+#         .mean()
+#         .select('temperature_2m')
+#         .rename('ECMWF_temperature_2m_2yr_avg')
+#         .clip(bounds),
+#         "visualization": {"min": 250, "max": 320, "palette": [
+#             '000080', '0000d9', '4000ff', '8000ff', '0080ff', '00ffff',
+#             '00ff80', '80ff00', 'daff00', 'ffff00', 'fff500', 'ffda00',
+#             'ffb000', 'ffa400', 'ff4f00', 'ff2500', 'ff0a00', 'ff00ff',
+#         ]},
+#     },
+#     "Surface Runoff": {
+#         "processing": lambda start, end, bounds: ee.ImageCollection("ECMWF/ERA5_LAND/MONTHLY_BY_HOUR")
+#         .filterDate(start, end)
+#         .filterBounds(bounds)
+#         .mean()
+#         .select("surface_runoff")
+#         .rename("ECMWF_surface_runoff_2yr_avg")
+#         .clip(bounds),
+#         "visualization": {"min": 0, "max": 50, "palette": ["blue", "cyan", "green", "yellow", "red"]},
+#     },
+#     "Elevation": {
+#         "processing": lambda start, end, bounds: ee.Image("USGS/3DEP/10m")
+#         .select('elevation')
+#         .rename('Elevation')
+#         .clip(bounds),
+#         "visualization": {"min": 0, "max": 3000, "palette": [
+#             '3ae237', 'b5e22e', 'd6e21f', 'fff705', 'ffd611', 'ffb613', 'ff8b13',
+#             'ff6e08', 'ff500d', 'ff0000', 'de0101', 'c21301', '0602ff', '235cb1',
+#             '307ef3', '269db1', '30c8e2', '32d3ef', '3be285', '3ff38f', '86e26f'
+#         ],},
+#     },  
+#     "Slope": {
+#         "processing": lambda start, end, bounds: ee.Terrain.slope(ee.Image("USGS/3DEP/10m").select('elevation'))
+#         .rename('Slope')
+#         .clip(bounds),
+#         "visualization": {"min": 0, "max": 60},
+#     },
+#     "Vegetation": {
+#         "processing": lambda start, end, bounds: ee.Image("USGS/GAP/CONUS/2011")
+#         .clip(bounds),
+#         "visualization": {"bands":['landcover'],"min": 1, "max": 584},
+#     },
+# }
+
+# # Function to extract the date range and geometry for the first dam
+# def get_state_bounds_and_date_range():
+#     if "Dam_data" not in st.session_state:
+#         st.error("No dam data available.")
+#         return None, None
+#     dam_data = st.session_state["Dam_data"]
+#     first_dam = dam_data.first()
+#     image_date = ee.Date(first_dam.get("Survey_Date"))
+#     start_date = image_date.advance(-6, 'month').format("YYYY-MM-dd")
+#     end_date = image_date.advance(6, 'month').format("YYYY-MM-dd")
+#     # Get state bounds
+#     states_dataset = ee.FeatureCollection("TIGER/2018/States")
+#     state_bounds = states_dataset.filterBounds(dam_data.geometry().bounds()).geometry()
+#     return start_date, end_date, state_bounds
+
+# if 'Initiate_analysis' in st.session_state:
+#     st.header("Select Additional Datasets to Include")
+
+#     start_date, end_date, state_bounds = get_state_bounds_and_date_range()
+#     if not (start_date and end_date and state_bounds):
+#         st.stop()
+
+# # Checkboxes for dataset selection
+#     st.write("Select datasets to include:")
+#     for dataset_name in datasets.keys():
+#         st.session_state.selected_datasets[dataset_name] = st.checkbox(
+#             dataset_name,
+#             value=st.session_state.selected_datasets.get(dataset_name, True),
+#         )
+#      # Map for Dataset Visualization
+#     st.write("Visualize Dataset on the Map")
+#     Dataset_Map = geemap.Map()
+#     Dataset_Map.add_basemap("SATELLITE")
+
+#     selected_dataset_name = st.selectbox("Choose a dataset to visualize:", ["Choose"] + list(datasets.keys()))
+#     if selected_dataset_name != "Choose":
+#         dataset = datasets[selected_dataset_name]["processing"](start_date, end_date, state_bounds)
+#         vis_params = datasets[selected_dataset_name]["visualization"]
+#         Dataset_Map.addLayer(dataset, vis_params, f"{selected_dataset_name} (Processed)")
+
+#     # Display the map
+#     Dataset_Map.centerObject(st.session_state["Dam_data"])
+#     Dataset_Map.to_streamlit(width=1200, height=700)
+
+#     # # "Use this Waterway Map" button
+#     if st.button("Confirm Datasets"):
+#         Confirm_datasets = 'confirm' 
+#         st.session_state['Confirm_datasets'] = Confirm_datasets
+
+# # Step 3: Filter Imagery per Dam
+# if 'Confirm_datasets' in st.session_state:
+#     st.success("Datasets confirmed. Proceeding to filter imagery.")
+#     st.header("Filter Imagery per Dam")
+#      # Button to start filtering process
+#     if st.button("Run Filtering and Visualization Process"):
+#         with st.spinner("Processing... this may take some time."):
+#             # Filter Imagery
+#             Dam_Collection = st.session_state['Dam_data']
+#             One_dam = Dam_Collection.limit(2)
+#             S2 = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+#             S2_cloud_filter = process_Sentinel2_with_cloud_coverage(S2)
+
+#             selected_datasets = st.session_state.selected_datasets
+#             Hydro = st.session_state.selected_waterway
+
+#             ImageFilter = S2_PixelExtraction_Export(One_dam, S2_cloud_filter, Hydro, selected_datasets)
+#             st.session_state['Single Image Collection'] = ImageFilter
+
+
+# if 'Single Image Collection' in st.session_state:
+#     Image_collection = st.session_state['Single Image Collection']
+#     S2_filename_id = Image_collection.aggregate_array("Full_id").getInfo()
+#     cloud_free_id = next((id for id in S2_filename_id if id.endswith("Cloud_0.0")), None)
+
+#     if not cloud_free_id:
+#                 st.error("No cloud-free images (Cloud_0.0) found in the collection.")
+#     else:
+#         specific_image = Image_collection.filter(ee.Filter.eq("Full_id", cloud_free_id)).first()
+#         all_bands = specific_image.bandNames().getInfo()
+
+#         # Define visualization options
+#         visualization_options = {
+#             "NDVI": specific_image.normalizedDifference(["S2_NIR", "S2_Red"]).rename("NDVI"),
+#             "NDWI": specific_image.normalizedDifference(["S2_Green", "S2_NIR"]).rename("NDWI"),
+#             "EVI": specific_image.expression(
+#                 "2.5 * ((NIR - Red) / (NIR + 6 * Red - 7.5 * Blue + 1))",
+#                 {"NIR": specific_image.select("S2_NIR"), "Red": specific_image.select("S2_Red"), "Blue": specific_image.select("S2_Blue")}
+#             ).rename("EVI"),
+#             "True Color (RGB)": specific_image.select(["S2_Red", "S2_Green", "S2_Blue"]),
+#         }
+
+#         # Combine bands and visualization options into a single dropdown
+#         dropdown_options = all_bands + list(visualization_options.keys())
+        
+#         st.success("Processing complete!")
+#         st.subheader("Visualize", divider='green')
+#         selected_option = st.selectbox("Select a band or visualization type:", ["Choose"] + dropdown_options)
+
+#         # Initialize map
+#         Image_Map = geemap.Map()
+#         Image_Map.add_basemap("SATELLITE")
+#         Image_Map.centerObject(specific_image)
+
+#         # Check the selected option
+#         if selected_option != "Choose":
+#             if selected_option in all_bands:
+#                 vis_image = specific_image.select(selected_option)
+#                 vis_params = {"min": 0, "max": 3000}  # Adjust based on the band's range
+#             elif selected_option in visualization_options:
+#                 vis_image = visualization_options[selected_option]
+#                 vis_params = {"min": 0, "max": 1} if selected_option in ["NDVI", "NDWI", "EVI"] else {"min": 0, "max": 3000}
+#             else:
+#                 vis_image = None
+
+#             if vis_image:
+#                 Image_Map.addLayer(vis_image, vis_params, selected_option)
+
+#         # Display the map
+#         st.write("Image Visualization:")
+#         Image_Map.to_streamlit(width=1200, height=700)
+
+
+
+# if 'Single Image Collection' in st.session_state:
+#     # Step 4: Export Images to Computer
+#     st.subheader("Export", divider='green')
+
+#     export_dir = st.text_input(
+#         "Enter the folder path where you want to export the images. "
+#         "Example (Windows): C:\\Users\\John\\Desktop\\ExportFolder. "
+#         "Example (Mac/Linux): /home/yourusername/Documents/ExportFolder"
+#     )
+#    # Button to start export process
+#     if st.button("Export Images"):
+#         if not export_dir:
+#             st.error("Please specify a folder path.")
+#         else:
+#             with st.spinner(f"Exporting images to {export_dir}... this may take some time."):
+#                 try:
+#                     # Split the Dam_Collection into smaller chunks
+#                     Dam_Collection = st.session_state['Dam_data']
+#                     num_chunks = 10  # Adjust based on your dataset size
+#                     dam_list = Dam_Collection.toList(Dam_Collection.size())
+#                     chunk_size = ee.Number(Dam_Collection.size()).divide(num_chunks).ceil().getInfo()
+
+#                     for i in range(num_chunks):
+#                         # Slice the current chunk
+#                         chunk = dam_list.slice(i * chunk_size, (i + 1) * chunk_size)
+#                         dam_chunk = ee.FeatureCollection(chunk)
 
                       
-                        S2 = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
-                        S2_cloud_filter = process_Sentinel2_with_cloud_coverage(S2)
+#                         S2 = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+#                         S2_cloud_filter = process_Sentinel2_with_cloud_coverage(S2)
 
-                        selected_datasets = st.session_state.selected_datasets
-                        Hydro = st.session_state.selected_waterway
+#                         selected_datasets = st.session_state.selected_datasets
+#                         Hydro = st.session_state.selected_waterway
 
-                        S2_chunk_export = ee.ImageCollection(S2_PixelExtraction_Export(dam_chunk, S2_cloud_filter, Hydro, selected_datasets))
+#                         S2_chunk_export = ee.ImageCollection(S2_PixelExtraction_Export(dam_chunk, S2_cloud_filter, Hydro, selected_datasets))
 
-                        # Generate filenames for the current chunk
-                        S2_filename_id = S2_chunk_export.aggregate_array("Full_id").getInfo()
+#                         # Generate filenames for the current chunk
+#                         S2_filename_id = S2_chunk_export.aggregate_array("Full_id").getInfo()
 
-                        # Export the current chunk
-                        geemap.ee_export_image_collection(
-                            S2_chunk_export,
-                            filenames=S2_filename_id,
-                            out_dir=export_dir,
-                            scale=5  # Adjust scale as needed
-                        )
+#                         # Export the current chunk
+#                         geemap.ee_export_image_collection(
+#                             S2_chunk_export,
+#                             filenames=S2_filename_id,
+#                             out_dir=export_dir,
+#                             scale=5  # Adjust scale as needed
+#                         )
 
-                        st.success(f"Chunk {i+1}/{num_chunks} exported successfully!")
+#                         st.success(f"Chunk {i+1}/{num_chunks} exported successfully!")
 
-                    st.success("All chunks have been exported successfully!")
-                except Exception as e:
-                    st.error(f"An error occurred during the export process: {e}")
+#                     st.success("All chunks have been exported successfully!")
+#                 except Exception as e:
+#                     st.error(f"An error occurred during the export process: {e}")
 
 
 
